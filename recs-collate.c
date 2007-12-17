@@ -48,7 +48,7 @@ struct collate_state
     int num_agg_instances;
     struct agg_instance *agg_instances;
 
-    bool cube;
+    int cube_max;
     char *cube_default;
 
     hash_t *clump_table;
@@ -118,7 +118,7 @@ int hash_comp_func(const void *_k1, const void *_k2)
         }
         else
         {
-            int cmp = strcmp(*k1++, *k2++);
+            int cmp = strcmp(k1[i], k2[i]);
             if(cmp != 0)
                 return cmp;
         }
@@ -232,27 +232,9 @@ void value_callback(struct parse_state *parse_state, void *_state)
     }
 }
 
-struct clump *find_or_create_clump(struct collate_state *state, char *buf)
+struct clump *find_or_create_clump(struct collate_state *state, char *key_vals[])
 {
-    /* First create the hash key we'll use to lookup this clump.
-     * Our hash key is a list of all the key field strings.
-     * They are still null-terminated in the buffer from when we
-     * were processing them in string_callback.  We just have to
-     * pack pointers for them into a char** that will serve as our key.
-     */
-    char *key_vals[state->num_key_fields+1];
-
-    for(int i = 0; i < state->num_key_fields; i++)
-    {
-        struct str_ref *r = &state->interesting_fields[i];
-        if(r->is_set)
-            key_vals[i] = buf + r->offset;
-        else
-            key_vals[i] = NULL;
-    }
-    key_vals[state->num_key_fields] = NULL;
-
-    /* now do the hash lookup. */
+    /* do the hash lookup based on key_vals */
     struct clump *clump = (struct clump*)hash_lookup(state->clump_table, key_vals);
 
     if(clump)
@@ -331,6 +313,36 @@ struct clump *find_or_create_clump(struct collate_state *state, char *buf)
     return clump;
 }
 
+void find_and_add_to_clump(struct collate_state *state, char *vals[], double d_vals[])
+{
+    struct clump *clump = find_or_create_clump(state, vals);
+
+    char *agg_data = (char*)&clump->aggregator_data[0];
+    for(int i = 0; i < state->num_agg_instances; i++)
+    {
+        char *agg_vals[MAX_INFIELDS_PER_AGGREGATOR];
+        double agg_d_vals[MAX_INFIELDS_PER_AGGREGATOR];
+        struct agg_instance *agg_inst = &state->agg_instances[i];
+
+        /* map the values to the ones that the aggregator cares about */
+
+        for(int j = 0; j < agg_inst->num_input_fields; j++)
+        {
+            agg_vals[j] = vals[agg_inst->input_fields[j]];
+            agg_d_vals[j] = d_vals[agg_inst->input_fields[j]];
+        }
+
+        /* run the aggregator's add callback! */
+
+        agg_inst->agg->add_func(agg_inst->config_data, agg_data, agg_vals, agg_d_vals);
+        agg_data += agg_inst->agg->data_size;
+    }
+
+    if(state->incremental)
+        dump_clump(clump, state);
+}
+
+
 /*
  * This callback is called at the end of each object.  If the object that's ending
  * is the top-level object, this is where we do the work of finding or creating
@@ -350,8 +362,6 @@ void object_callback(struct parse_state *parse_state, void *_state)
                 buf[field->offset+field->len] = '\0';
         }
 
-        struct clump *clump = find_or_create_clump(state, buf);
-
         /* first pack the interesting values into a table of char** */
 
         char *vals[state->num_interesting_fields+1];
@@ -369,7 +379,7 @@ void object_callback(struct parse_state *parse_state, void *_state)
         /* now try to convert each value into a double, for aggregators that want that.
          * values that have no numeric data are represented as NAN */
 
-        double dbl_vals[state->num_interesting_fields+1];
+        double dbl_vals[state->num_interesting_fields];
 
         for(int i = 0; i < state->num_interesting_fields; i++)
         {
@@ -384,31 +394,31 @@ void object_callback(struct parse_state *parse_state, void *_state)
                 dbl_vals[i] = NAN;
         }
 
-        /* let each aggregator instance process the record and add data to this clump */
-
-        char *agg_data = (char*)&clump->aggregator_data[0];
-        for(int i = 0; i < state->num_agg_instances; i++)
+        /* to support cubing, we use the binary representation of the numbers 0 -- cube_max
+         * as a power set.  if a bit is 0, then the real value is used.  if a bit is 1,
+         * the cube default is used.  if we're not cubing, cube_max is 1 and we only use
+         * 0: the value for which all real values are used. */
+        for(int i = 0; i < state->cube_max; i++)
         {
-            char *ch_vals[MAX_INFIELDS_PER_AGGREGATOR];
-            double d_vals[MAX_INFIELDS_PER_AGGREGATOR];
-            struct agg_instance *agg_inst = &state->agg_instances[i];
+            char *clump_vals[state->num_interesting_fields];
+            double dbl_clump_vals[state->num_interesting_fields];
 
-            /* map the values to the ones that the aggregator cares about */
-
-            for(int j = 0; j < agg_inst->num_input_fields; j++)
+            for(int j = 0; j < state->num_interesting_fields; j++)
             {
-                ch_vals[j] = vals[agg_inst->input_fields[j]];
-                d_vals[j] = dbl_vals[agg_inst->input_fields[j]];
+                if((1 << j) & i)
+                {
+                    clump_vals[j] = state->cube_default;
+                    dbl_clump_vals[j] = NAN;
+                }
+                else
+                {
+                    clump_vals[j] = vals[j];
+                    dbl_clump_vals[j] = dbl_vals[j];
+                }
             }
 
-            /* run the aggregator's add callback! */
-
-            agg_inst->agg->add_func(agg_inst->config_data, agg_data, ch_vals, d_vals);
-            agg_data += agg_inst->agg->data_size;
+            find_and_add_to_clump(state, clump_vals, dbl_clump_vals);
         }
-
-        if(state->incremental)
-            dump_clump(clump, state);
     }
 }
 
@@ -565,6 +575,7 @@ int main(int argc, char *argv[])
     struct parse_state state;
     int agg_instances_size = 6;
     int agg_instances_data_size = 0;
+    bool cube = false;
     struct collate_state cs = {
          .max_clumps = 1,
          .incremental = false,
@@ -573,7 +584,7 @@ int main(int argc, char *argv[])
          .clump_table = hash_create(HASHCOUNT_T_MAX, hash_comp_func, hash_func),
          .clumps_head = NULL,
          .clumps_tail = NULL,
-         .cube = false,
+         .cube_max = 1,
          .cube_default = "ALL"
     };
 
@@ -650,7 +661,7 @@ int main(int argc, char *argv[])
         }
         else if(strcmp(arg, "--cube") == 0)
         {
-            cs.cube = true;
+            cube = true;
         }
         else if(strcmp(arg, "--cube-default") == 0)
         {
@@ -681,9 +692,6 @@ int main(int argc, char *argv[])
     if(fields_len == 0)
         usage_err("must specify --key or --aggregator");
 
-    if(cs.cube && cs.max_clumps < pow(2, cs.num_key_fields))
-        usage_err("when cubing, you must have at least 2 ** num_key_fields clumps");
-
     cs.num_interesting_fields = fields_len;
     cs.num_key_fields = 0;
 
@@ -699,6 +707,14 @@ int main(int argc, char *argv[])
             cs.interesting_field_names[cs.num_key_fields + nonkey_field_num++] = fields[i].name;
 
     num_key_fields = cs.num_key_fields;
+
+    if(cube)
+    {
+        cs.cube_max = 1 << cs.num_key_fields;
+        if(cs.max_clumps != MAX_CLUMPS_INFINITE && cs.max_clumps < cs.cube_max)
+            usage_err("when cubing, you must have at least 2 ** num_key_fields clumps");
+    }
+
 
     /* adjust agg instance field names to reflect new field order */
     for(int i = 0; i < cs.num_agg_instances; i++)
