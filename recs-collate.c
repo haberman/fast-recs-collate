@@ -577,6 +577,9 @@ int main(int argc, char *argv[])
          .cube_default = "ALL"
     };
 
+    int files_len = 0, files_size = 5;
+    FILE **files = malloc(sizeof(*files) * files_size);
+
     /* round up the size of each aggregator data to a multiple of sizeof(double) */
     for(struct aggregator *agg = aggregators; agg->name; agg++)
         agg->data_size = ceil((double)agg->data_size / sizeof(double)) * sizeof(double);
@@ -656,7 +659,24 @@ int main(int argc, char *argv[])
                 usage_err("argument '--cube-default' must be followed by a string");
             cs.cube_default = strdup(cube_default);
         }
+        else
+        {
+            /* interpret the argument as a filename */
+            FILE *f = fopen(arg, "r");
+            if(f)
+            {
+                RESIZE_ARRAY_IF_NECESSARY(files, files_size, files_len+1);
+                files[files_len++] = f;
+            }
+            else
+            {
+                usage_err("Couldn't open file '%s' for reading", arg);
+            }
+        }
     }
+
+    if(files_len == 0)
+        files[files_len++] = stdin;
 
     if(fields_len == 0)
         usage_err("must specify --key or --aggregator");
@@ -711,22 +731,26 @@ int main(int argc, char *argv[])
     cs.available_clumps = malloc(cs.clump_size * cs.total_available_clumps);
     cs.next_clump = 0;
 
-    FILE *f = stdin;
-    init_parser(&state, &g, f);
-
-    register_callback(&state, "string", string_callback, &cs);
-    register_callback(&state, "value", value_callback, &cs);
-    register_callback(&state, "object", object_callback, &cs);
-
-    bool eof = false;
-
-    while(!eof)
+    for(int i = 0; i < files_len; i++)
     {
-        for(int i = 0; i < cs.num_interesting_fields; i++)
-            cs.interesting_fields[i].is_set = false;
+        init_parser(&state, &g, files[i]);
 
-        parse(&state, &eof);
-        reinit_parse_state(&state);
+        register_callback(&state, "string", string_callback, &cs);
+        register_callback(&state, "value", value_callback, &cs);
+        register_callback(&state, "object", object_callback, &cs);
+
+        bool eof = false;
+
+        while(!eof)
+        {
+            for(int field = 0; field < cs.num_interesting_fields; field++)
+                cs.interesting_fields[field].is_set = false;
+
+            parse(&state, &eof);
+            reinit_parse_state(&state);
+        }
+
+        free_parse_state(&state);
     }
 
     hscan_t scan;
@@ -739,7 +763,6 @@ int main(int argc, char *argv[])
         hash_scan_delete(cs.clump_table, node);
     }
 
-    free_parse_state(&state);
     free_grammar(g);
 }
 
