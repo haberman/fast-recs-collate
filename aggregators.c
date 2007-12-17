@@ -23,6 +23,24 @@ static bool use_one_field(char *config_str, int *num_fields, char *fields[])
     }
 }
 
+static bool use_two_fields(char *config_str, int *num_fields, char *fields[])
+{
+    if(*config_str)
+    {
+        char *comma = strchr(config_str, ',');
+        if(!comma) return false;
+        *comma++ = '\0';
+        *num_fields = 2;
+        fields[0] = config_str;
+        fields[1] = comma;
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
 /*
  * Average
  */
@@ -186,20 +204,7 @@ struct cov_data
 
 static bool cov_parse_args(void **config_data, char *config_str, int *num_fields, char **fields)
 {
-    if(*config_str)
-    {
-        char *comma = strchr(config_str, ',');
-        if(!comma) return false;
-        *comma++ = '\0';
-        *num_fields = 2;
-        fields[0] = config_str;
-        fields[1] = comma;
-        return true;
-    }
-    else
-    {
-        return false;
-    }
+    return use_two_fields(config_str, num_fields, fields);
 }
 
 static void cov_init(void *_c, void *_d)
@@ -214,7 +219,7 @@ static void cov_init(void *_c, void *_d)
 static void cov_add(void *_c, void *_d, char *ch_data[], double num_data[])
 {
     struct cov_data *d = _d;
-    if(!isnan(num_data[0]) && !isnan(num_data[0]))
+    if(!isnan(num_data[0]) && !isnan(num_data[1]))
     {
         d->count++;
         d->sum_of_products += num_data[0] * num_data[1];
@@ -223,12 +228,17 @@ static void cov_add(void *_c, void *_d, char *ch_data[], double num_data[])
     }
 }
 
+static double cov_val(struct cov_data *d)
+{
+    double cov = (d->sum_of_products / d->count) -
+                 ((d->sum_of_first / d->count) * (d->sum_of_second / d->count));
+    return cov;
+}
+
 static void cov_dump(void *_c, void *_d)
 {
     struct cov_data *d = _d;
-    double cov = (d->sum_of_products / d->count) -
-                 ((d->sum_of_first / d->count) * (d->sum_of_second / d->count));
-    printf("%g", cov);
+    printf("%f", cov_val(d));
 }
 
 /*
@@ -552,14 +562,60 @@ static void var_add(void *_c, void *_d, char *ch_data[], double num_data[])
     }
 }
 
+static double var_val(struct var_data *d)
+{
+    double avg = d->sum / d->count;
+    double var = (d->sum_of_squares / d->count) - (avg * avg);
+    return var;
+}
+
 static void var_dump(void *_c, void *_d)
 {
     struct var_data *d = _d;
-    double avg = d->sum / d->count;
-    double var = (d->sum_of_squares / d->count) - (avg * avg);
-    printf("%g", var);
+    printf("%g", var_val(d));
 }
 
+/*
+ * Correlation
+ */
+
+struct corr_data
+{
+    struct cov_data cov_data;
+    struct var_data var_data1;
+    struct var_data var_data2;
+};
+
+static bool corr_parse_args(void **config_data, char *config_str, int *num_fields, char **fields)
+{
+    return use_two_fields(config_str, num_fields, fields);
+}
+
+static void corr_init(void *_c, void *_d)
+{
+    struct corr_data *d = _d;
+    cov_init(_c, &d->cov_data);
+    var_init(_c, &d->var_data1);
+    var_init(_c, &d->var_data2);
+}
+
+static void corr_add(void *_c, void *_d, char *ch_data[], double num_data[])
+{
+    struct corr_data *d = _d;
+    cov_add(NULL, &d->cov_data, ch_data, num_data);
+    var_add(NULL, &d->var_data1, ch_data, num_data);
+    var_add(NULL, &d->var_data2, ch_data+1, num_data+1);
+}
+
+static void corr_dump(void *_c, void *_d)
+{
+    struct corr_data *d = _d;
+    double cov = cov_val(&d->cov_data);
+    double var1 = var_val(&d->var_data1);
+    double var2 = var_val(&d->var_data2);
+    double corr = cov / sqrt(var1 * var2);
+    printf("%g", corr);
+}
 
 struct aggregator aggregators[] = {
     {"average", "avg", sizeof(struct avg_data),
@@ -568,6 +624,8 @@ struct aggregator aggregators[] = {
       concat_parse_args, concat_init, concat_add, concat_dump, concat_free},
     {"count", "ct", sizeof(struct count_data),
       count_parse_args, count_init, count_add, count_dump, NULL},
+    {"correlation", "corr", sizeof(struct corr_data),
+      corr_parse_args, corr_init, corr_add, corr_dump, NULL},
     {"covariance", "cov", sizeof(struct cov_data),
       cov_parse_args, cov_init, cov_add, cov_dump, NULL},
     {"maximum", "max", sizeof(struct max_data),
