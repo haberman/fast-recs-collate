@@ -1,7 +1,7 @@
 
 CFLAGS=-std=c99 -Wall -O6
 OBJS=recs-collate.o lookup3.o hash.o aggregators.o
-GAZELLE_DIR=../gazelle
+GAZELLE_DIR=/Users/joshua/code/gazelle
 .PHONY: all clean
 
 all: recs-collate
